@@ -5,15 +5,10 @@ import { defaultCover } from '@libs/defaultCover';
 import { NovelStatus } from '@libs/novelStatus';
 import { load as loadCheerio } from 'cheerio';
 
-/**
- * Project Gutenberg plugin for LNReader
- * Uses the free Gutendex API (https://gutendex.com) for catalog + search.
- * Full book text is served as a single chapter (cleaned of PG boilerplate).
- */
 class ProjectGutenberg implements Plugin.PluginBase {
   id = 'projectgutenberg';
   name = 'Project Gutenberg';
-  version = '1.0.0';
+  version = '1.0.1';
   icon = 'src/en/projectgutenberg/icon.png';
   site = 'https://www.gutenberg.org';
   filters = {
@@ -36,15 +31,6 @@ class ProjectGutenberg implements Plugin.PluginBase {
       ],
       type: FilterTypes.Picker,
     },
-    copyright: {
-      label: 'Copyright',
-      value: 'false',
-      options: [
-        { label: 'Public Domain only', value: 'false' },
-        { label: 'All (incl. copyrighted)', value: '' },
-      ],
-      type: FilterTypes.Picker,
-    },
   } satisfies Filters;
 
   private baseApi = 'https://gutendex.com';
@@ -55,7 +41,7 @@ class ProjectGutenberg implements Plugin.PluginBase {
       `https://www.gutenberg.org/cache/epub/${book.id}/pg${book.id}.cover.medium.jpg` ||
       defaultCover;
     return {
-      name: book.title,
+      name: book.title || 'Untitled',
       path: String(book.id),
       cover,
     };
@@ -63,49 +49,54 @@ class ProjectGutenberg implements Plugin.PluginBase {
 
   async popularNovels(
     page: number,
-    {
-      showLatestNovels,
-      filters,
-    }: Plugin.PopularNovelsOptions<typeof this.filters>,
+    { filters }: Plugin.PopularNovelsOptions<typeof this.filters>,
   ): Promise<Plugin.NovelItem[]> {
-    const params = new URLSearchParams({
-      languages: 'en',
-      page: String(page),
-    });
+    try {
+      const params = new URLSearchParams({
+        languages: 'en',
+        page: String(page),
+        copyright: 'false',
+      });
 
-    if (filters?.copyright?.value === 'false') {
-      params.set('copyright', 'false');
-    }
-    if (filters?.topic?.value) {
-      params.set('topic', filters.topic.value);
-    }
-    // Gutendex defaults to popularity (download_count). No true "latest" sort,
-    // so we just keep popularity ordering.
-    if (showLatestNovels) {
-      // still popularity – Gutendex has no date sort on the public API
-    }
+      if (filters?.topic?.value) {
+        params.set('topic', filters.topic.value);
+      }
 
-    const url = `${this.baseApi}/books/?${params.toString()}`;
-    const res = await fetchApi(url);
-    const data = await res.json();
-
-    return (data.results || []).map((b: any) => this.bookToNovelItem(b));
+      const url = `${this.baseApi}/books/?${params.toString()}`;
+      const res = await fetchApi(url);
+      if (!res.ok) {
+        throw new Error(`Gutendex HTTP ${res.status}`);
+      }
+      const data = await res.json();
+      return (data.results || []).map((b: any) => this.bookToNovelItem(b));
+    } catch (e) {
+      console.error('ProjectGutenberg popularNovels error:', e);
+      return [];
+    }
   }
 
   async searchNovels(
     searchTerm: string,
     page: number,
   ): Promise<Plugin.NovelItem[]> {
-    const params = new URLSearchParams({
-      search: searchTerm,
-      languages: 'en',
-      page: String(page),
-      copyright: 'false',
-    });
-    const url = `${this.baseApi}/books/?${params.toString()}`;
-    const res = await fetchApi(url);
-    const data = await res.json();
-    return (data.results || []).map((b: any) => this.bookToNovelItem(b));
+    try {
+      const params = new URLSearchParams({
+        search: searchTerm,
+        languages: 'en',
+        page: String(page),
+        copyright: 'false',
+      });
+      const url = `${this.baseApi}/books/?${params.toString()}`;
+      const res = await fetchApi(url);
+      if (!res.ok) {
+        throw new Error(`Gutendex HTTP ${res.status}`);
+      }
+      const data = await res.json();
+      return (data.results || []).map((b: any) => this.bookToNovelItem(b));
+    } catch (e) {
+      console.error('ProjectGutenberg searchNovels error:', e);
+      return [];
+    }
   }
 
   async parseNovel(novelPath: string): Promise<Plugin.SourceNovel> {
@@ -129,24 +120,13 @@ class ProjectGutenberg implements Plugin.PluginBase {
       `https://www.gutenberg.org/cache/epub/${book.id}/pg${book.id}.cover.medium.jpg` ||
       defaultCover;
 
-    // Prefer HTML, fall back to plain text
     const htmlUrl =
       book.formats?.['text/html'] ||
       book.formats?.['text/html; charset=utf-8'] ||
       null;
-    const txtUrl =
-      book.formats?.['text/plain; charset=utf-8'] ||
-      book.formats?.['text/plain; charset=us-ascii'] ||
-      book.formats?.['text/plain'] ||
-      null;
+    const chapterPath = htmlUrl ? `html/${id}` : `txt/${id}`;
 
-    const chapterPath = htmlUrl
-      ? `html/${id}`
-      : txtUrl
-        ? `txt/${id}`
-        : `html/${id}`; // hope for the best
-
-    const novel: Plugin.SourceNovel = {
+    return {
       path: novelPath,
       name: book.title,
       author: authors || 'Unknown',
@@ -162,14 +142,12 @@ class ProjectGutenberg implements Plugin.PluginBase {
         },
       ],
     };
-    return novel;
   }
 
   async parseChapter(chapterPath: string): Promise<string> {
     const [kind, id] = chapterPath.split('/');
     if (!id) throw new Error('Invalid chapter path');
 
-    // Re-fetch metadata to get the real download URL
     const metaRes = await fetchApi(`${this.baseApi}/books/${id}`);
     const book = await metaRes.json();
 
@@ -183,18 +161,11 @@ class ProjectGutenberg implements Plugin.PluginBase {
       const html = await fetchText(htmlUrl);
       const $ = loadCheerio(html);
 
-      // Strip Project Gutenberg header / footer
       $('#pg-header, #pg-footer, .pg-boilerplate, #pg-machine-header').remove();
-      // Also common class names
       $('[id^="pg-"]').remove();
 
-      // Prefer the body content after cleaning
-      const body = $('body').html() || $.root().html() || html;
-      content = body
-        .replace(/Project Gutenberg.*?ebook/gi, '')
-        .replace(/^\s+|\s+$/g, '');
+      content = $('body').html() || $.root().html() || html;
     } else {
-      // plain text
       const txtUrl =
         book.formats?.['text/plain; charset=utf-8'] ||
         book.formats?.['text/plain; charset=us-ascii'] ||
@@ -202,7 +173,6 @@ class ProjectGutenberg implements Plugin.PluginBase {
         `https://www.gutenberg.org/files/${id}/${id}-0.txt`;
       let text = await fetchText(txtUrl);
 
-      // Remove the classic PG header/footer
       const startMarkers = [
         '*** START OF THE PROJECT GUTENBERG EBOOK',
         '*** START OF THIS PROJECT GUTENBERG EBOOK',
@@ -231,7 +201,6 @@ class ProjectGutenberg implements Plugin.PluginBase {
         }
       }
 
-      // Convert plain text to simple HTML paragraphs
       content = text
         .split(/\n\s*\n/)
         .map(p => p.trim().replace(/\n/g, ' '))
@@ -244,9 +213,7 @@ class ProjectGutenberg implements Plugin.PluginBase {
   }
 
   resolveUrl = (path: string, isNovel?: boolean) => {
-    if (isNovel) {
-      return `${this.site}/ebooks/${path}`;
-    }
+    if (isNovel) return `${this.site}/ebooks/${path}`;
     return `${this.site}/ebooks/${path.split('/').pop()}`;
   };
 }
